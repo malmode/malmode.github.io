@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pythagorean Grid Instrument</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    cursor: crosshair;
+    font-family: sans-serif;
+    background: #111;
+  }
+  #topbar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 44px;
+    background: #222;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    z-index: 20;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  }
+  #toggleControls {
+    background: #555;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  #toggleControls:hover { background: #666; }
+  #stopBtn {
+    background: red;
+    color: white;
+    font-size: 15px;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  #stopBtn:hover { background: darkred; }
+  #controls {
+    position: absolute;
+    top: 44px; left: 0;
+    background: rgba(255,255,255,0.95);
+    padding: 10px 16px;
+    border-radius: 0 0 8px 0;
+    z-index: 10;
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 240px;
+    font-size: 13px;
+  }
+  #controls.show { display: flex; }
+  label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  #keys {
+    display: grid;
+    grid-template-columns: repeat(16, 1fr);
+    grid-template-rows: repeat(8, 1fr);
+    height: 100%;
+  }
+  .key {
+    border: 1px solid rgba(0,0,0,0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    color: rgba(0,0,0,0.6);
+    user-select: none;
+    transition: transform 0.08s, box-shadow 0.1s;
+  }
+  .key.active {
+    transform: scale(1.05);
+    box-shadow: 0 0 10px #000;
+    color: #000;
+  }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <button id="toggleControls">Controls</button>
+  <button id="stopBtn">STOP</button>
+</div>
+<div id="controls">
+  <label>Waveform:
+    <select id="waveform">
+      <option value="sine">Sine</option>
+      <option value="square" selected>Square</option>
+      <option value="triangle">Triangle</option>
+      <option value="sawtooth">Sawtooth</option>
+    </select>
+  </label>
+  <label>Tuning: <span id="tuningVal">0</span> semitones
+    <input type="range" id="tuning" min="-24" max="24" value="0">
+  </label>
+  <label>Volume:
+    <input type="range" id="volume" min="0" max="1" step="0.01" value="0.2">
+  </label>
+  <label>Filter Cutoff:
+    <input type="range" id="cutoff" min="50" max="5000" step="10" value="1200">
+  </label>
+  <label>Filter Q:
+    <input type="range" id="q" min="0.1" max="20" step="0.1" value="1">
+  </label>
+  <label>Detune:
+    <input type="range" id="detune" min="-100" max="100" step="1" value="0">
+  </label>
+  <label>Attack:
+    <input type="range" id="attack" min="0" max="2" step="0.01" value="0.05">
+  </label>
+  <label>Release:
+    <input type="range" id="release" min="0" max="2" step="0.01" value="0.2">
+  </label>
+</div>
+<div id="keys"></div>
+<script>
+const COLS = 16, ROWS = 8;
+const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+// DOM
+const waveformEl = document.getElementById("waveform");
+const tuningEl   = document.getElementById("tuning");
+const volumeEl   = document.getElementById("volume");
+const detuneEl   = document.getElementById("detune");
+const cutoffEl   = document.getElementById("cutoff");
+const qEl        = document.getElementById("q");
+const attackEl   = document.getElementById("attack");
+const releaseEl  = document.getElementById("release");
+const keysContainer = document.getElementById("keys");
+const stopBtn = document.getElementById("stopBtn");
+const toggleControlsBtn = document.getElementById("toggleControls");
+const controlsPanel = document.getElementById("controls");
+
+// state
+let activeVoices = [];
+let heldVoices   = [];
+let lastVoice = null;
+let isDown = false;
+// store DOM key elements for resume
+let lastStoppedKeys = [];
+
+// utils
+function colorAt(col,row){
+  const hue = (col / COLS) * 360;
+  const light = 30 + (row / ROWS) * 40;
+  return `hsl(${hue},70%,${light}%)`;
+}
+function freqAt(col, row) {
+  const invertedRow = ROWS - 1 - row;
+  const index = invertedRow * COLS + col;
+  const minHz = 32.7, maxHz = 2093;
+  const tuningOffset = parseInt(tuningEl.value) || 0;
+  const ratio = index / (COLS*ROWS - 1);
+  const baseFreq = minHz * Math.pow(maxHz/minHz, ratio);
+  return baseFreq * Math.pow(2, tuningOffset/12);
+}
+function getKeyFromPoint(x,y) {
+  const el = document.elementFromPoint(x,y);
+  return el && el.classList && el.classList.contains("key") ? el : null;
+}
+
+// build grid
+for (let r=0;r<ROWS;r++){
+  for (let c=0;c<COLS;c++){
+    const div=document.createElement("div");
+    div.className="key";
+    div.dataset.col=c;
+    div.dataset.row=r;
+    div.style.background=colorAt(c,r);
+    keysContainer.appendChild(div);
+  }
+}
+
+// voice
+function createVoice(freq){
+  const osc=ctx.createOscillator();
+  const gain=ctx.createGain();
+  const filter=ctx.createBiquadFilter();
+  osc.type=waveformEl.value;
+  osc.frequency.setValueAtTime(freq,ctx.currentTime);
+  osc.detune.value=parseFloat(detuneEl.value);
+  filter.type="lowpass";
+  filter.frequency.setValueAtTime(parseFloat(cutoffEl.value),ctx.currentTime);
+  filter.Q.setValueAtTime(parseFloat(qEl.value),ctx.currentTime);
+  osc.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
+  const vol=parseFloat(volumeEl.value);
+  const attack=parseFloat(attackEl.value);
+  gain.gain.setValueAtTime(0,ctx.currentTime);
+  gain.gain.linearRampToValueAtTime(vol,ctx.currentTime+attack);
+  osc.start();
+  return {osc,gainNode:gain,filter,release:parseFloat(releaseEl.value),freq,key:null};
+}
+function stopVoice(v){
+  if (!v||!v.osc) return;
+  const rel=v.release??parseFloat(releaseEl.value);
+  const now=ctx.currentTime;
+  v.gainNode.gain.cancelScheduledValues(now);
+  v.gainNode.gain.setValueAtTime(v.gainNode.gain.value,now);
+  v.gainNode.gain.linearRampToValueAtTime(0.0001,now+rel);
+  v.osc.stop(now+rel+0.02);
+  setTimeout(()=>{try{v.osc.disconnect();v.gainNode.disconnect();v.filter.disconnect();}catch(e){}},(rel+0.12)*1000);
+  if (v.key) v.key.classList.remove("active");
+}
+function startVoiceForKey(keyEl,hold=false){
+  const freq=freqAt(+keyEl.dataset.col,+keyEl.dataset.row);
+  const v=createVoice(freq); v.key=keyEl;
+  if (hold) heldVoices.push(v);
+  else {activeVoices.push(v); lastVoice=v; isDown=true;}
+  keyEl.classList.add("active");
+  // when a voice starts make sure button shows STOP
+  stopBtn.textContent = "STOP";
+  return v;
+}
+
+// input events
+document.addEventListener("mousedown",e=>{
+  if (e.button!==0) return;
+  const key=getKeyFromPoint(e.clientX,e.clientY);
+  if (!key) return;
+  if (ctx.state==="suspended") ctx.resume();
+  if (e.shiftKey){
+    const existing=heldVoices.find(v=>v.key===key);
+    if (existing){ stopVoice(existing); heldVoices=heldVoices.filter(v=>v!==existing);}
+    else startVoiceForKey(key,true);
+  } else {
+    if (lastVoice){ stopVoice(lastVoice); activeVoices=activeVoices.filter(v=>v!==lastVoice); lastVoice=null; }
+    startVoiceForKey(key,false);
+  }
+});
+document.addEventListener("mousemove",e=>{
+  if (!isDown||!lastVoice) return;
+  const key=getKeyFromPoint(e.clientX,e.clientY); if (!key) return;
+  const freq=freqAt(+key.dataset.col,+key.dataset.row);
+  lastVoice.osc.frequency.setTargetAtTime(freq,ctx.currentTime,0.05);
+  if (lastVoice.key&&lastVoice.key!==key) lastVoice.key.classList.remove("active");
+  lastVoice.key=key; key.classList.add("active");
+});
+document.addEventListener("mouseup",e=>{
+  if (e.button!==0) return;
+  if (!isDown) return;
+  if (lastVoice){ stopVoice(lastVoice); activeVoices=activeVoices.filter(v=>v!==lastVoice); lastVoice=null; }
+  isDown=false;
+});
+
+// STOP button: toggle stop/play. shift+click forces resume.
+stopBtn.addEventListener("click", e=>{
+  const anyActive = activeVoices.length || heldVoices.length;
+
+  if (e.shiftKey) {
+    if (lastStoppedKeys.length) {
+      const toResume = lastStoppedKeys.slice();
+      lastStoppedKeys = [];
+      toResume.forEach(k => startVoiceForKey(k, true));
+      stopBtn.textContent = "STOP";
+    }
+    return;
+  }
+
+  if (anyActive) {
+    // stop and save DOM keys
+    lastStoppedKeys = [...activeVoices, ...heldVoices].map(v => v.key);
+    activeVoices.forEach(stopVoice);
+    heldVoices.forEach(stopVoice);
+    activeVoices = [];
+    heldVoices = [];
+    lastVoice = null;
+    isDown = false;
+    document.querySelectorAll(".key").forEach(k => k.classList.remove("active"));
+    stopBtn.textContent = "PLAY";
+  } else {
+    // resume if stored
+    if (lastStoppedKeys.length) {
+      const toResume = lastStoppedKeys.slice();
+      lastStoppedKeys = [];
+      toResume.forEach(k => startVoiceForKey(k, true));
+      stopBtn.textContent = "STOP";
+    }
+  }
+});
+
+// controls toggle
+toggleControlsBtn.addEventListener("click",()=>controlsPanel.classList.toggle("show"));
+
+// tuning updates
+tuningEl.addEventListener("input",()=>{
+  document.getElementById("tuningVal").textContent=tuningEl.value;
+  [...activeVoices,...heldVoices].forEach(v=>{
+    const newF=freqAt(+v.key.dataset.col,+v.key.dataset.row);
+    try { v.osc.frequency.setTargetAtTime(newF,ctx.currentTime,0.05); v.freq=newF; } catch(e){}
+  });
+});
+
+// live updates
+function updateVoices(){
+  const wf=waveformEl.value;
+  const det=parseFloat(detuneEl.value);
+  const cutoff=parseFloat(cutoffEl.value);
+  const q=parseFloat(qEl.value);
+  const vol=parseFloat(volumeEl.value);
+  const rel=parseFloat(releaseEl.value);
+  const all=[...activeVoices,...heldVoices];
+  all.forEach(v=>{
+    try{
+      v.osc.type=wf;
+      v.osc.detune.setValueAtTime(det,ctx.currentTime);
+      v.filter.frequency.setTargetAtTime(cutoff,ctx.currentTime,0.05);
+      v.filter.Q.setTargetAtTime(q,ctx.currentTime,0.05);
+      v.gainNode.gain.setTargetAtTime(vol,ctx.currentTime,0.05);
+      v.release=rel;
+    }catch(e){}
+  });
+}
+[waveformEl,detuneEl,cutoffEl,qEl,volumeEl,releaseEl,attackEl].forEach(el=>el.addEventListener("input",updateVoices));
+
+// enable scroll wheel adjustments on sliders
+function enableScrollSlider(el) {
+  el.addEventListener("wheel", e => {
+    e.preventDefault();
+    const step = parseFloat(el.step) || 1;
+    const min = parseFloat(el.min);
+    const max = parseFloat(el.max);
+    let val = parseFloat(el.value);
+    val += (e.deltaY < 0 ? step : -step);
+    val = Math.min(max, Math.max(min, val));
+    el.value = val;
+    el.dispatchEvent(new Event("input"));
+  });
+}
+
+[
+  tuningEl, volumeEl, detuneEl,
+  cutoffEl, qEl, attackEl, releaseEl
+].forEach(enableScrollSlider);
+
+</script>
+</body>
+</html>
